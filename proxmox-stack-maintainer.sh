@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-#  pve_stack_updater.sh — Proxmox Stack Updater
+#  proxmox-stack-maintainer.sh — Proxmox Stack Maintainer
 #  Run on the Proxmox HOST as root
 #
 #  Supports:
@@ -10,11 +10,16 @@
 #    - Docker containers (via Watchtower)
 #    - OpenWRT containers (via opkg)
 #
-#  Usage:    bash pve_stack_updater.sh
-#  Logs:     /var/log/pve_stack_updater/YYYY-MM-DD.log
+#  Usage:    bash proxmox-stack-maintainer.sh
+#  Logs:     /var/log/proxmox-stack-maintainer/YYYY-MM-DD.log
 # ============================================================
 
-LOG_DIR="/var/log/pve_stack_updater"
+APP_NAME="Proxmox Stack Maintainer"
+LOG_DIR="/var/log/proxmox-stack-maintainer"
+STATE_DIR="/var/lib/proxmox-stack-maintainer"
+INVENTORY_FILE="$STATE_DIR/inventory.tsv"
+PREV_INVENTORY_FILE="$STATE_DIR/inventory.previous.tsv"
+CURRENT_INVENTORY_FILE="$STATE_DIR/inventory.current.tsv"
 LOG_FILE="$LOG_DIR/$(date +%Y-%m-%d).log"
 SKIP_IDS="600"   # Fallback: space-separated VMIDs to skip (e.g. "100 200 300")
                  # Preferred: tag a container "no-auto-update" in the Proxmox GUI instead
@@ -27,7 +32,13 @@ BLU='\033[1;34m'
 CYN='\033[0;36m'
 NC='\033[0m'
 
-mkdir -p "$LOG_DIR"
+mkdir -p "$LOG_DIR" "$STATE_DIR"
+: > "$CURRENT_INVENTORY_FILE"
+if [ -f "$INVENTORY_FILE" ]; then
+    cp "$INVENTORY_FILE" "$PREV_INVENTORY_FILE"
+else
+    : > "$PREV_INVENTORY_FILE"
+fi
 
 log() {
     local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
@@ -39,6 +50,59 @@ ok()    { log "${GRN}[ OK] $1${NC}"; }
 info()  { log "${YLW}[---] $1${NC}"; }
 title() { log "${BLU}===  $1${NC}"; }
 host()  { log "${CYN}[HST] $1${NC}"; }
+
+inventory_escape() {
+    printf '%s' "$1" | tr '\t' ' ' | tr '\n' ' '
+}
+
+inventory_previous_line() {
+    local type="$1" vmid="$2"
+    awk -F'\t' -v type="$type" -v vmid="$vmid" '$1 == type && $2 == vmid { print; exit }' "$PREV_INVENTORY_FILE"
+}
+
+inventory_seen_current() {
+    local type="$1" vmid="$2"
+    awk -F'\t' -v type="$type" -v vmid="$vmid" '$1 == type && $2 == vmid { found=1 } END { exit found ? 0 : 1 }' "$CURRENT_INVENTORY_FILE"
+}
+
+record_stack_member() {
+    local type="$1" vmid="$2" name="$3" status="$4" tags="$5"
+    local now first_seen prev_line prev_status prev_name safe_name safe_tags
+
+    now="$(date '+%Y-%m-%d %H:%M:%S')"
+    safe_name="$(inventory_escape "$name")"
+    safe_tags="$(inventory_escape "$tags")"
+    prev_line="$(inventory_previous_line "$type" "$vmid")"
+
+    if [ -z "$prev_line" ]; then
+        first_seen="$now"
+        info "NEW ${type^^} detected: [$vmid] $name (status: $status)"
+    else
+        first_seen="$(echo "$prev_line" | awk -F'\t' '{print $6}')"
+        prev_name="$(echo "$prev_line" | awk -F'\t' '{print $3}')"
+        prev_status="$(echo "$prev_line" | awk -F'\t' '{print $4}')"
+        [ "$prev_name" != "$safe_name" ] && info "${type^^} renamed: [$vmid] $prev_name → $name"
+        [ "$prev_status" != "$status" ] && info "${type^^} status changed: [$vmid] $name ($prev_status → $status)"
+    fi
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$type" "$vmid" "$safe_name" "$status" "$safe_tags" "$first_seen" "$now" >> "$CURRENT_INVENTORY_FILE"
+}
+
+summarise_removed_stack_members() {
+    [ -s "$PREV_INVENTORY_FILE" ] || return 0
+
+    while IFS=$'\t' read -r type vmid name status tags first_seen last_seen; do
+        [ -z "$type" ] && continue
+        if ! inventory_seen_current "$type" "$vmid"; then
+            info "REMOVED ${type^^} from stack inventory: [$vmid] $name (last status: $status, last seen: $last_seen)"
+        fi
+    done < "$PREV_INVENTORY_FILE"
+}
+
+finalise_inventory() {
+    sort -t $'\t' -k1,1 -k2,2n "$CURRENT_INVENTORY_FILE" > "$INVENTORY_FILE"
+    rm -f "$CURRENT_INVENTORY_FILE"
+}
 
 # ── SANITY CHECK ─────────────────────────────────────────────
 if ! command -v pct &>/dev/null; then
@@ -54,7 +118,7 @@ fi
 # ── HEADER ───────────────────────────────────────────────────
 echo "" | tee -a "$LOG_FILE"
 log "============================================================"
-log "  Proxmox Stack Updater"
+log "  Proxmox Stack Maintainer"
 log "  Host   : $(hostname)"
 log "  Date   : $(date)"
 log "============================================================"
@@ -111,6 +175,8 @@ while IFS= read -r line; do
     # Primary: honour "no-auto-update" tag set in the Proxmox GUI
     # (Container → Options → Tags → add: no-auto-update)
     TAGS=$(pct config "$VMID" 2>/dev/null | grep '^tags:' | cut -d' ' -f2-)
+    record_stack_member "lxc" "$VMID" "$NAME" "$STATUS" "$TAGS"
+
     if echo "$TAGS" | grep -qw "no-auto-update"; then
         info "[$VMID] $NAME — SKIPPED (tagged no-auto-update)"
         TOTAL_SKIPPED=$((TOTAL_SKIPPED + 1))
@@ -261,6 +327,26 @@ while IFS= read -r line; do
     echo "" | tee -a "$LOG_FILE"
 
 done < <(pct list | tail -n +2)
+
+# ── DISCOVER QEMU VMS ────────────────────────────────────────
+if command -v qm &>/dev/null; then
+    title "QEMU VMS — Inventory only"
+    while IFS= read -r line; do
+        VMID=$(echo "$line" | awk '{print $1}')
+        NAME=$(echo "$line" | awk '{print $2}')
+        STATUS=$(echo "$line" | awk '{print $3}')
+
+        [ -z "$VMID" ] && continue
+
+        TAGS=$(qm config "$VMID" 2>/dev/null | grep '^tags:' | cut -d' ' -f2-)
+        record_stack_member "vm" "$VMID" "$NAME" "$STATUS" "$TAGS"
+        info "[$VMID] $NAME — VM detected, inventory only (guest updates are out of scope)"
+    done < <(qm list | tail -n +2)
+    echo "" | tee -a "$LOG_FILE"
+fi
+
+summarise_removed_stack_members
+finalise_inventory
 
 # ── DOCKER SUMMARY ───────────────────────────────────────────
 if [ ${#DOCKER_CONTAINERS[@]} -gt 0 ]; then
