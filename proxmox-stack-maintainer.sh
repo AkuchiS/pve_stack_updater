@@ -15,14 +15,54 @@
 # ============================================================
 
 APP_NAME="Proxmox Stack Maintainer"
+APP_SLUG="proxmox-stack-maintainer"
+CONFIG_FILE="${CONFIG_FILE:-/etc/proxmox-stack-maintainer/config.env}"
 LOG_DIR="/var/log/proxmox-stack-maintainer"
 STATE_DIR="/var/lib/proxmox-stack-maintainer"
 INVENTORY_FILE="$STATE_DIR/inventory.tsv"
 PREV_INVENTORY_FILE="$STATE_DIR/inventory.previous.tsv"
 CURRENT_INVENTORY_FILE="$STATE_DIR/inventory.current.tsv"
-LOG_FILE="$LOG_DIR/$(date +%Y-%m-%d).log"
+LOG_RETENTION_DAYS="30"
 SKIP_IDS="600"   # Fallback: space-separated VMIDs to skip (e.g. "100 200 300")
                  # Preferred: tag a container "no-auto-update" in the Proxmox GUI instead
+SERVICE_CHECKS=(
+  "Prismarr=http://10.12.0.30:7070"
+)
+DRY_RUN=0
+CHECK_ONLY=0
+
+usage() {
+    cat <<'EOF'
+Proxmox Stack Maintainer
+
+Usage:
+  proxmox-stack-maintainer.sh [--dry-run] [--check] [--config /path/config.env]
+
+Options:
+  --dry-run       Discover stack and log intended actions without applying upgrades.
+  --check         Validate host prerequisites and print install/runtime status.
+  --config PATH   Source an alternate config file before running.
+  -h, --help      Show this help.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run) DRY_RUN=1 ;;
+        --check) CHECK_ONLY=1 ;;
+        --config) shift; CONFIG_FILE="${1:-}" ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "ERROR: unknown option: $1"; usage; exit 2 ;;
+    esac
+    shift
+done
+
+if [ -n "$CONFIG_FILE" ] && [ -f "$CONFIG_FILE" ]; then
+    # shellcheck source=/etc/proxmox-stack-maintainer/config.env
+    source "$CONFIG_FILE"
+fi
+
+LOG_FILE="$LOG_DIR/$(date +%Y-%m-%d).log"
 
 # Colours
 RED='\033[0;31m'
@@ -31,6 +71,47 @@ YLW='\033[1;33m'
 BLU='\033[1;34m'
 CYN='\033[0;36m'
 NC='\033[0m'
+
+runtime_check() {
+    local rc=0
+    echo "$APP_NAME runtime check"
+    echo "Config: ${CONFIG_FILE:-none}"
+    if [ "$EUID" -ne 0 ]; then
+        echo "FAIL: must run as root"
+        rc=1
+    else
+        echo "OK: running as root"
+    fi
+    for cmd in pct apt-get awk grep sort tee curl; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            echo "OK: command found: $cmd"
+        else
+            echo "FAIL: missing command: $cmd"
+            rc=1
+        fi
+    done
+    if command -v qm >/dev/null 2>&1; then
+        echo "OK: command found: qm"
+    else
+        echo "WARN: qm not found; VM coverage will be skipped"
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl is-enabled proxmox-stack-maintainer.timer >/dev/null 2>&1 \
+            && echo "OK: systemd timer enabled" \
+            || echo "WARN: systemd timer not enabled"
+        systemctl list-timers --all --no-pager 2>/dev/null | grep -q 'proxmox-stack-maintainer.timer' \
+            && echo "OK: systemd timer listed" \
+            || echo "WARN: systemd timer not listed"
+    fi
+    echo "Log dir: $LOG_DIR"
+    echo "State dir: $STATE_DIR"
+    return "$rc"
+}
+
+if [ "$CHECK_ONLY" -eq 1 ]; then
+    runtime_check
+    exit $?
+fi
 
 mkdir -p "$LOG_DIR" "$STATE_DIR"
 : > "$CURRENT_INVENTORY_FILE"
@@ -121,6 +202,7 @@ log "============================================================"
 log "  Proxmox Stack Maintainer"
 log "  Host   : $(hostname)"
 log "  Date   : $(date)"
+[ "$DRY_RUN" -eq 1 ] && log "  Mode   : DRY RUN (no upgrades will be applied)"
 log "============================================================"
 echo "" | tee -a "$LOG_FILE"
 
@@ -132,7 +214,11 @@ DOCKER_CONTAINERS=()
 # ── PROXMOX HOST SECURITY UPDATES ────────────────────────────
 title "PROXMOX HOST — Security patches (Debian only)"
 
-apt-get update -qq 2>&1 | tee -a "$LOG_FILE"
+if [ "$DRY_RUN" -eq 1 ]; then
+    info "HOST — DRY RUN: skipping apt-get update"
+else
+    apt-get update -qq 2>&1 | tee -a "$LOG_FILE"
+fi
 
 # Identify upgradable packages, excluding PVE, kernel and proxmox packages
 HOST_PKGS=$(apt-get --simulate upgrade 2>/dev/null \
@@ -148,15 +234,19 @@ else
     host "HOST — $HOST_COUNT security package(s) to upgrade"
     host "HOST — Upgrading: $(echo "$HOST_PKGS" | tr '\n' ' ')"
 
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $HOST_PKGS 2>&1 | tee -a "$LOG_FILE"
-    HOST_EXIT=${PIPESTATUS[0]}
-
-    if [ $HOST_EXIT -eq 0 ]; then
-        ok "HOST — Successfully applied $HOST_COUNT security patch(es)"
-        TOTAL_UPDATED=$((TOTAL_UPDATED + 1))
+    if [ "$DRY_RUN" -eq 1 ]; then
+        info "HOST — DRY RUN: would apply $HOST_COUNT security patch(es)"
     else
-        flag "HOST — Security patch failed (check log for details)"
-        TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $HOST_PKGS 2>&1 | tee -a "$LOG_FILE"
+        HOST_EXIT=${PIPESTATUS[0]}
+
+        if [ $HOST_EXIT -eq 0 ]; then
+            ok "HOST — Successfully applied $HOST_COUNT security patch(es)"
+            TOTAL_UPDATED=$((TOTAL_UPDATED + 1))
+        else
+            flag "HOST — Security patch failed (check log for details)"
+            TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+        fi
     fi
 fi
 
@@ -204,23 +294,29 @@ while IFS= read -r line; do
         info "[$VMID] $NAME — Docker detected, handling separately"
         DOCKER_CONTAINERS+=("$VMID:$NAME")
 
-        # Pull all named registry images — grep '/' filters out locally built
-        # images (no org/registry prefix) which cannot be pulled from any
-        # registry and would error. Works generically across any Docker setup.
-        DOCKER_OUTPUT=$(pct exec "$VMID" -- sh -c "
-            docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
-            | grep -v '<none>' | grep '/' | sort -u | while read img; do
-                echo -n \"  Pulling \$img ... \"
-                result=\$(docker pull \$img 2>&1 | tail -1)
-                echo \"\$result\"
-            done
-        " 2>/dev/null)
+        if [ "$DRY_RUN" -eq 1 ]; then
+            DOCKER_IMAGES=$(pct exec "$VMID" -- sh -c "docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -v '<none>' | grep '/' | sort -u" 2>/dev/null || true)
+            info "[$VMID] $NAME — DRY RUN: would pull registry images and run Watchtower"
+            [ -n "$DOCKER_IMAGES" ] && log "$DOCKER_IMAGES"
+        else
+            # Pull all named registry images — grep '/' filters out locally built
+            # images (no org/registry prefix) which cannot be pulled from any
+            # registry and would error. Works generically across any Docker setup.
+            DOCKER_OUTPUT=$(pct exec "$VMID" -- sh -c "
+                docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+                | grep -v '<none>' | grep '/' | sort -u | while read img; do
+                    echo -n \"  Pulling \$img ... \"
+                    result=\$(docker pull \$img 2>&1 | tail -1)
+                    echo \"\$result\"
+                done
+            " 2>/dev/null)
 
-        if [ -n "$DOCKER_OUTPUT" ]; then
-            log "$DOCKER_OUTPUT"
-            pct exec "$VMID" -- bash -c "
-                docker run --rm -v /var/run/docker.sock:/var/run/docker.sock containrrr/watchtower --run-once 2>&1 | tail -5
-            " 2>/dev/null && ok "[$VMID] $NAME — Docker images updated" || info "[$VMID] $NAME — No Docker updates or Watchtower not available"
+            if [ -n "$DOCKER_OUTPUT" ]; then
+                log "$DOCKER_OUTPUT"
+                pct exec "$VMID" -- bash -c "
+                    docker run --rm -v /var/run/docker.sock:/var/run/docker.sock containrrr/watchtower --run-once 2>&1 | tail -5
+                " 2>/dev/null && ok "[$VMID] $NAME — Docker images updated" || info "[$VMID] $NAME — No Docker updates or Watchtower not available"
+            fi
         fi
 
         TOTAL_UPDATED=$((TOTAL_UPDATED + 1))
@@ -262,20 +358,24 @@ while IFS= read -r line; do
         info "[$VMID] $NAME — $UPGRADABLE package(s) to upgrade via opkg"
         log "[$VMID] $NAME — Upgrading: $(echo "$UPGRADABLE_LIST" | tr '\n' ' ')"
 
-        OPKG_UPGRADE_RAW=$(pct exec "$VMID" -- sh -c "
-            pkgs=\$(opkg list-upgradable 2>/dev/null | awk '{print \$1}' | tr '\n' ' ')
-            opkg upgrade \$pkgs 2>&1
-            echo __EXIT__:\$?
-        " 2>/dev/null)
-        UPGRADE_EXIT=$(echo "$OPKG_UPGRADE_RAW" | grep '__EXIT__:' | cut -d: -f2 | tr -d '[:space:]')
-        UPGRADE_OUT=$(echo "$OPKG_UPGRADE_RAW" | grep -v '__EXIT__:')
-
-        if [ "$UPGRADE_EXIT" = "0" ]; then
-            ok "[$VMID] $NAME — Successfully upgraded $UPGRADABLE package(s) via opkg"
-            TOTAL_UPDATED=$((TOTAL_UPDATED + 1))
+        if [ "$DRY_RUN" -eq 1 ]; then
+            info "[$VMID] $NAME — DRY RUN: would upgrade $UPGRADABLE opkg package(s)"
         else
-            flag "[$VMID] $NAME — opkg upgrade failed: $UPGRADE_OUT"
-            TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+            OPKG_UPGRADE_RAW=$(pct exec "$VMID" -- sh -c "
+                pkgs=\$(opkg list-upgradable 2>/dev/null | awk '{print \$1}' | tr '\n' ' ')
+                opkg upgrade \$pkgs 2>&1
+                echo __EXIT__:\$?
+            " 2>/dev/null)
+            UPGRADE_EXIT=$(echo "$OPKG_UPGRADE_RAW" | grep '__EXIT__:' | cut -d: -f2 | tr -d '[:space:]')
+            UPGRADE_OUT=$(echo "$OPKG_UPGRADE_RAW" | grep -v '__EXIT__:')
+
+            if [ "$UPGRADE_EXIT" = "0" ]; then
+                ok "[$VMID] $NAME — Successfully upgraded $UPGRADABLE package(s) via opkg"
+                TOTAL_UPDATED=$((TOTAL_UPDATED + 1))
+            else
+                flag "[$VMID] $NAME — opkg upgrade failed: $UPGRADE_OUT"
+                TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+            fi
         fi
 
         echo "" | tee -a "$LOG_FILE"
@@ -313,35 +413,76 @@ while IFS= read -r line; do
     UPGRADE_LIST=$(pct exec "$VMID" -- sh -c "apt-get --simulate upgrade 2>/dev/null | grep '^Inst' | awk '{print \$2}' | tr '\n' ' '")
     log "[$VMID] $NAME — Upgrading: $UPGRADE_LIST"
 
-    UPGRADE_OUT=$(pct exec "$VMID" -- sh -c "DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq 2>&1")
-    UPGRADE_EXIT=$?
-
-    if [ $UPGRADE_EXIT -eq 0 ]; then
-        ok "[$VMID] $NAME — Successfully upgraded $UPGRADABLE package(s)"
-        TOTAL_UPDATED=$((TOTAL_UPDATED + 1))
+    if [ "$DRY_RUN" -eq 1 ]; then
+        info "[$VMID] $NAME — DRY RUN: would upgrade $UPGRADABLE apt package(s)"
     else
-        flag "[$VMID] $NAME — Upgrade failed: $UPGRADE_OUT"
-        TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+        UPGRADE_OUT=$(pct exec "$VMID" -- sh -c "DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq 2>&1")
+        UPGRADE_EXIT=$?
+
+        if [ $UPGRADE_EXIT -eq 0 ]; then
+            ok "[$VMID] $NAME — Successfully upgraded $UPGRADABLE package(s)"
+            TOTAL_UPDATED=$((TOTAL_UPDATED + 1))
+        else
+            flag "[$VMID] $NAME — Upgrade failed: $UPGRADE_OUT"
+            TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+        fi
     fi
 
     echo "" | tee -a "$LOG_FILE"
 
 done < <(pct list | tail -n +2)
 
-# ── DISCOVER QEMU VMS ────────────────────────────────────────
+# ── QEMU/KVM VM COVERAGE ────────────────────────────────────
+VM_TOTAL=0
+VM_RUNNING=0
+VM_AGENT_OK=0
+VM_AGENT_MISSING=0
 if command -v qm &>/dev/null; then
-    title "QEMU VMS — Inventory only"
+    title "QEMU/KVM VMs — inventory and guest-agent coverage"
     while IFS= read -r line; do
         VMID=$(echo "$line" | awk '{print $1}')
         NAME=$(echo "$line" | awk '{print $2}')
         STATUS=$(echo "$line" | awk '{print $3}')
 
         [ -z "$VMID" ] && continue
+        VM_TOTAL=$((VM_TOTAL + 1))
 
         TAGS=$(qm config "$VMID" 2>/dev/null | grep '^tags:' | cut -d' ' -f2-)
         record_stack_member "vm" "$VMID" "$NAME" "$STATUS" "$TAGS"
-        info "[$VMID] $NAME — VM detected, inventory only (guest updates are out of scope)"
+
+        if [ "$STATUS" != "running" ]; then
+            info "[VM:$VMID] $NAME — SKIPPED (status: $STATUS)"
+            continue
+        fi
+
+        VM_RUNNING=$((VM_RUNNING + 1))
+        if qm guest ping "$VMID" >/dev/null 2>&1; then
+            ok "[VM:$VMID] $NAME — running + qemu-guest-agent reachable"
+            VM_AGENT_OK=$((VM_AGENT_OK + 1))
+        else
+            info "[VM:$VMID] $NAME — running, but qemu-guest-agent not responding"
+            VM_AGENT_MISSING=$((VM_AGENT_MISSING + 1))
+        fi
+        info "[VM:$VMID] $NAME — VM updates are inventory-only unless guest-specific maintenance is configured"
     done < <(qm list | tail -n +2)
+    echo "" | tee -a "$LOG_FILE"
+fi
+
+# ── SERVICE HEALTH CHECKS ────────────────────────────────────
+if [ ${#SERVICE_CHECKS[@]} -gt 0 ]; then
+    title "SERVICE HEALTH CHECKS"
+    for entry in "${SERVICE_CHECKS[@]}"; do
+        SVC_NAME="${entry%%=*}"
+        SVC_URL="${entry#*=}"
+        [ -z "$SVC_NAME" ] || [ -z "$SVC_URL" ] && continue
+        HTTP_CODE=$(curl -sS -L -o /dev/null -m 8 -w "%{http_code}" "$SVC_URL" 2>/dev/null || echo "000")
+        if echo "$HTTP_CODE" | grep -Eq '^(2|3)[0-9][0-9]$'; then
+            ok "$SVC_NAME — reachable ($HTTP_CODE) at $SVC_URL"
+        else
+            flag "$SVC_NAME — health check failed ($HTTP_CODE) at $SVC_URL"
+            TOTAL_ERRORS=$((TOTAL_ERRORS + 1))
+        fi
+    done
     echo "" | tee -a "$LOG_FILE"
 fi
 
@@ -378,10 +519,11 @@ if [ $TOTAL_ERRORS -gt 0 ]; then
 else
     ok "  RESULT: $TOTAL_UPDATED updated | $TOTAL_SKIPPED skipped | $TOTAL_ERRORS errors"
 fi
+log "  VM coverage: total=$VM_TOTAL running=$VM_RUNNING guest-agent-ok=$VM_AGENT_OK guest-agent-missing=$VM_AGENT_MISSING"
 log "  NOTE: PVE/kernel updates require manual review + reboot"
 log "  Log saved to: $LOG_FILE"
 log "============================================================"
 echo "" | tee -a "$LOG_FILE"
 
 # Trim logs older than 30 days
-find "$LOG_DIR" -name "*.log" -mtime +30 -delete 2>/dev/null
+find "$LOG_DIR" -name "*.log" -mtime +"$LOG_RETENTION_DAYS" -delete 2>/dev/null

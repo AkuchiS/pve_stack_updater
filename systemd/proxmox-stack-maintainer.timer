@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Proxmox Stack Maintainer nightly
+Documentation=https://github.com/AkuchiS/proxmox-stack-maintainer
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=30m
+Persistent=true
+Unit=proxmox-stack-maintainer.service
+
+[Install]
+WantedBy=timers.target

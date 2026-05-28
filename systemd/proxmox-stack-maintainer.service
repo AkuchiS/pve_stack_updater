@@ -1,0 +1,13 @@
+[Unit]
+Description=Proxmox Stack Maintainer
+Documentation=https://github.com/AkuchiS/proxmox-stack-maintainer
+Wants=network-online.target
+After=network-online.target pve-cluster.service
+ConditionPathExists=/usr/local/bin/proxmox-stack-maintainer.sh
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/proxmox-stack-maintainer.sh --config /etc/proxmox-stack-maintainer/config.env
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

@@ -1,148 +1,186 @@
 # Proxmox Stack Maintainer
 
-Safe automated maintenance for Proxmox VE homelab stacks.
+Safe, autonomous maintenance for Proxmox VE homelab stacks.
 
-`proxmox-stack-maintainer` runs on the Proxmox host and handles the stack in one pass: the host, LXCs, opkg-based containers, and Docker workloads running inside LXCs. It is intentionally conservative: Proxmox VE and kernel packages are skipped so they can be reviewed manually with a planned reboot.
+`proxmox-stack-maintainer` runs on the Proxmox host as a nightly systemd timer. Each run discovers the current Proxmox stack, maintains every running LXC it can safely identify, tracks QEMU/KVM VMs for coverage, runs service health checks, and records an inventory so new, renamed, stopped, and removed guests are visible without manually editing a list.
+
+It is intentionally conservative: Proxmox VE and kernel packages are skipped so they can be reviewed manually with a planned reboot.
 
 ## What it does
 
 | Target | Method | Details |
 |--------|--------|---------|
-| Proxmox host | `apt` | Debian security patches only — PVE/kernel packages intentionally skipped |
-| LXC (Debian/Ubuntu) | `apt-get update && upgrade` | Standard apt upgrade, non-interactive |
-| LXC (opkg-based) | `opkg update && upgrade` | Auto-detected — covers OpenWRT, Entware, and embedded Linux using opkg |
-| LXC (Docker) | `docker pull` + Watchtower | Pulls named registry images, then runs Watchtower `--run-once` to restart updated containers |
-| QEMU VMs | Inventory only | Detects and tracks VMs, but does not update inside guest OSes |
+| Proxmox host | `apt` | Debian security/userland packages only; PVE/kernel packages intentionally skipped |
+| LXC: Debian/Ubuntu | `apt-get update && apt-get upgrade` | Auto-detected, non-interactive |
+| LXC: opkg-based | `opkg update && opkg upgrade` | Auto-detected; covers OpenWRT, Entware, and embedded Linux containers |
+| LXC: Docker host | `docker pull` + Watchtower | Pulls registry-backed images and runs Watchtower `--run-once` |
+| QEMU/KVM VMs | Inventory + guest-agent coverage | Detects VMs and checks `qm guest ping`; guest OS updates are not attempted blindly |
+| Services | HTTP health checks | Configurable post-run checks such as Prismarr, Sonarr, Radarr, etc. |
 
-PVE and kernel packages are deliberately excluded from host updates. They carry a higher risk of breaking running workloads and should be applied manually with a planned reboot.
+## Self-healing inventory
 
-## Stack inventory detection
+The maintainer does **not** depend on a static VMID list.
 
-The maintainer keeps a persistent inventory at:
+On every run it queries live Proxmox state with `pct list` and `qm list`, writes the current inventory to:
 
 ```bash
 /var/lib/proxmox-stack-maintainer/inventory.tsv
 ```
 
-On every run it compares the current Proxmox stack with the previous inventory and logs:
+and compares it with the previous run. It logs:
 
 - new LXCs
 - new VMs
-- renamed LXCs/VMs
+- renamed guests
 - status changes
-- removed LXCs/VMs
+- removed guests
+- running VMs whose qemu guest agent is not responding
 
-New running LXCs are maintained automatically unless they are skipped by tag or ID. VMs are detected and logged as inventory-only because updating guest OSes safely requires guest-specific access such as SSH, cloud-init, or an agent.
+New running LXCs are automatically added to the maintenance pass unless skipped by tag or config. This is the “self-healing” behaviour: add a new LXC to Proxmox, and the next timer run discovers it and applies the matching update procedure based on the package manager/tools inside that container.
+
+VMs are tracked and health-checked, but not updated inside the guest OS by default. That is intentional: safe VM maintenance needs guest-specific credentials, agents, cloud-init, or SSH policy. The inventory makes uncovered VMs visible instead of silently ignoring them.
 
 ## Requirements
 
 - Proxmox VE 7+ host
 - Run as `root` on the Proxmox host, not inside a container
 - Internet access from the host and containers
+- `systemd` for autonomous timer install
 
-## Installation
+## Install
 
-```bash
-curl -o /usr/local/bin/proxmox-stack-maintainer.sh \
-  https://raw.githubusercontent.com/AkuchiS/proxmox-stack-maintainer/main/proxmox-stack-maintainer.sh
-
-chmod +x /usr/local/bin/proxmox-stack-maintainer.sh
-```
-
-If the repository has not yet been renamed, use the old repo path temporarily:
+Clone the repository on the Proxmox host, then run the installer:
 
 ```bash
-curl -o /usr/local/bin/proxmox-stack-maintainer.sh \
-  https://raw.githubusercontent.com/AkuchiS/pve_stack_updater/main/proxmox-stack-maintainer.sh
+git clone https://github.com/AkuchiS/proxmox-stack-maintainer.git
+cd proxmox-stack-maintainer
+sudo ./install.sh
 ```
 
-## Usage
-
-Run manually:
+If the GitHub repository has not yet been renamed, clone the current repository name into the new local folder name:
 
 ```bash
-/usr/local/bin/proxmox-stack-maintainer.sh
+git clone https://github.com/AkuchiS/pve_stack_updater.git proxmox-stack-maintainer
+cd proxmox-stack-maintainer
+sudo ./install.sh
 ```
 
-Or add a cron job to run nightly at 3am:
-
-```bash
-echo '0 3 * * * root /usr/local/bin/proxmox-stack-maintainer.sh >> /var/log/proxmox-stack-maintainer/cron.log 2>&1' \
-  > /etc/cron.d/proxmox-stack-maintainer
-```
-
-## Skipping containers
-
-### Preferred — Proxmox GUI tag
-
-In the Proxmox web UI: select the container → **Options** → **Tags** → add:
+The installer creates:
 
 ```text
-no-auto-update
+/usr/local/bin/proxmox-stack-maintainer.sh
+/etc/proxmox-stack-maintainer/config.env
+/etc/systemd/system/proxmox-stack-maintainer.service
+/etc/systemd/system/proxmox-stack-maintainer.timer
+/var/log/proxmox-stack-maintainer
+/var/lib/proxmox-stack-maintainer
 ```
 
-The maintainer reads this tag automatically and skips the container with a clear log message. This survives script updates from GitHub.
+and enables the nightly timer.
 
-### Fallback — SKIP_IDS list
-
-Edit the `SKIP_IDS` variable near the top of the script:
+## Verify install
 
 ```bash
-SKIP_IDS="100 200 300"   # Space-separated VMIDs
+proxmox-stack-maintainer.sh --check
+systemctl status proxmox-stack-maintainer.timer
+systemctl list-timers --all | grep proxmox-stack-maintainer
 ```
 
-Stopped containers are automatically skipped regardless of either setting.
+Run once manually:
 
-## Logs
+```bash
+sudo systemctl start proxmox-stack-maintainer.service
+sudo journalctl -u proxmox-stack-maintainer.service -n 100 --no-pager
+```
 
-Logs are written to:
+Run without applying upgrades:
+
+```bash
+sudo proxmox-stack-maintainer.sh --dry-run
+```
+
+## Configure
+
+Edit:
+
+```bash
+sudo nano /etc/proxmox-stack-maintainer/config.env
+```
+
+Default config:
+
+```bash
+SKIP_IDS="600"
+LOG_RETENTION_DAYS="30"
+SERVICE_CHECKS=(
+  "Prismarr=http://10.12.0.30:7070"
+)
+```
+
+### Skipping containers
+
+Preferred method: add the Proxmox tag `no-auto-update` to the container.
+
+Fallback method: add the VMID to `SKIP_IDS` in `/etc/proxmox-stack-maintainer/config.env`.
+
+Stopped containers are skipped automatically.
+
+### Service health checks
+
+Add checks to the `SERVICE_CHECKS` bash array:
+
+```bash
+SERVICE_CHECKS=(
+  "Prismarr=http://10.12.0.30:7070"
+  "Sonarr=http://10.12.0.30:8989"
+  "Radarr=http://10.12.0.30:7878"
+)
+```
+
+2xx/3xx HTTP status is treated as healthy. Anything else is logged as an error.
+
+## Logs and state
+
+Daily logs:
 
 ```bash
 /var/log/proxmox-stack-maintainer/YYYY-MM-DD.log
 ```
 
-Logs older than 30 days are rotated automatically.
+Inventory:
 
-Example:
-
-```text
-[2026-04-08 13:18:55] ============================================================
-[2026-04-08 13:18:55]   Proxmox Stack Maintainer
-[2026-04-08 13:18:55]   Host   : grayskull
-[2026-04-08 13:18:55] ============================================================
-[2026-04-08 13:18:56] [ OK] HOST — No security patches pending
-[2026-04-08 13:18:57] [---] NEW LXC detected: [100] plex (status: running)
-[2026-04-08 13:19:01] [ OK] [100] plex — Already up to date
-[2026-04-08 13:19:01] [---] NEW VM detected: [900] debian-template (status: stopped)
-[2026-04-08 13:19:01] [---] [900] debian-template — VM detected, inventory only (guest updates are out of scope)
-[2026-04-08 13:21:18] [ OK]   RESULT: 3 updated | 1 skipped | 0 errors
+```bash
+/var/lib/proxmox-stack-maintainer/inventory.tsv
+/var/lib/proxmox-stack-maintainer/inventory.previous.tsv
 ```
 
-## Notes
+Systemd journal:
 
-### Watchtower stack trace
+```bash
+journalctl -u proxmox-stack-maintainer.service
+```
 
-On some Docker containers, Watchtower prints a Go stack trace when exiting after `--run-once`. This is a cosmetic issue in Watchtower's exit handling and does not indicate a failure — the `[ OK]` line confirms a clean result.
+Logs older than `LOG_RETENTION_DAYS` are removed automatically.
 
-### Docker image filtering
+## Uninstall
 
-The script only pulls images with a registry prefix, for example `ghcr.io/...` or `docker.io/...`. Locally-built images with no `/` in the name are automatically skipped to avoid pull errors.
+```bash
+sudo ./uninstall.sh
+```
 
-### opkg-based containers
+The uninstall script removes the systemd timer/service and binary, but preserves config, logs, and inventory state.
 
-The script detects any container running `opkg`, not just OpenWRT. This covers Entware on NAS devices such as QNAP and Synology, plus other embedded Linux distributions packaged as LXC containers.
+## Safety notes
 
-A single `pct exec` call is used per operation to work around tmpfs `/tmp` not persisting between separate exec sessions, which is common in these environments.
-
-> **Note:** OpenWRT 22.03 is end-of-life. Package feed availability may vary. Major version upgrades, such as to 23.05, require full container replacement and are out of scope for this script.
-
-### Reboot notification
-
-If a host package update requires a reboot, the script flags it clearly in the log and summary. It does **not** reboot automatically.
+- Proxmox/kernel packages are deliberately skipped.
+- The maintainer does not reboot the host automatically.
+- Running VMs are inventoried and guest-agent checked, not blindly updated.
+- Package-manager detection is dynamic: LXCs are handled based on what exists inside the container (`docker`, `opkg`, `apt-get`).
+- Docker image pulls only target registry-style image names and skip local-only images.
 
 ## Contributing
 
-PRs welcome. If you run a container type not covered, such as Alpine `apk` or Fedora `dnf`, detection follows the same `command -v <package-manager>` pattern used for `opkg` and `apt`.
+PRs welcome. Additional package managers can be added using the same detection pattern used for `opkg` and `apt-get`.
 
 ## License
 
