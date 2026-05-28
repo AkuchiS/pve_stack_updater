@@ -55,6 +55,24 @@ if ! command -v systemctl >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v pct >/dev/null 2>&1; then
+  cat >&2 <<'EOF'
+ERROR: pct not found.
+
+Proxmox Stack Maintainer must be installed on the actual Proxmox VE host,
+not inside a guest LXC/VM. This guard prevents installing a timer that cannot
+see or maintain the host stack.
+
+Fix: SSH to the Proxmox node itself, then rerun ./install.sh there.
+EOF
+  exit 1
+fi
+
+if [ ! -d /etc/pve ] && [ ! -f /etc/pve/.version ]; then
+  echo "ERROR: /etc/pve not found; this does not look like a Proxmox VE host." >&2
+  exit 1
+fi
+
 install -d -m 0755 /usr/local/bin "$CONFIG_DIR" "$LOG_DIR" "$STATE_DIR" /etc/systemd/system
 install -m 0755 "$BIN_SRC" "$BIN_DEST"
 

@@ -46,6 +46,9 @@ VMs are tracked and health-checked, but not updated inside the guest OS by defau
 - Run as `root` on the Proxmox host, not inside a container
 - Internet access from the host and containers
 - `systemd` for autonomous timer install
+- Proxmox host tools available on the install target (`pct`, `/etc/pve`)
+
+The installer refuses to run inside a guest LXC/VM. Install it on the Proxmox node itself so it can see and maintain the full stack.
 
 ## Install
 
