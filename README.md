@@ -1,4 +1,4 @@
-# pve_stack_updater
+# ProxSweep
 
 Automated update script for Proxmox VE homelab stacks. Runs on the Proxmox host and handles every container type in one pass — no per-container configuration required.
 
@@ -22,22 +22,22 @@ PVE and kernel packages are deliberately excluded from the host update — these
 ## Installation
 
 ```bash
-curl -o /usr/local/bin/pve_stack_updater.sh \
-  https://raw.githubusercontent.com/YOUR_USERNAME/pve_stack_updater/main/pve_stack_updater.sh
+curl -o /usr/local/bin/proxsweep.sh \
+  https://raw.githubusercontent.com/YOUR_USERNAME/proxsweep/main/proxsweep.sh
 
-chmod +x /usr/local/bin/pve_stack_updater.sh
+chmod +x /usr/local/bin/proxsweep.sh
 ```
 
 ## Usage
 
 Run manually:
 ```bash
-/usr/local/bin/pve_stack_updater.sh
+/usr/local/bin/proxsweep.sh
 ```
 
 Or add a cron job to run nightly at 3am:
 ```bash
-echo '0 3 * * * root /usr/local/bin/pve_stack_updater.sh >> /var/log/pve_stack_updater/cron.log 2>&1' \
+echo '0 3 * * * root /usr/local/bin/proxsweep.sh >> /var/log/proxsweep/cron.log 2>&1' \
   > /etc/cron.d/pve-stack-updater
 ```
 
@@ -63,7 +63,7 @@ Stopped containers are automatically skipped regardless of either setting.
 
 ## Logs
 
-Logs are written to `/var/log/pve_stack_updater/YYYY-MM-DD.log` and rotated automatically after 30 days.
+Logs are written to `/var/log/proxsweep/YYYY-MM-DD.log` and rotated automatically after 30 days.
 
 ```
 [2026-04-08 13:18:55] ============================================================
