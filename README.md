@@ -68,7 +68,7 @@ Logs are written to `/var/log/proxsweep/YYYY-MM-DD.log` and rotated automaticall
 ```
 [2026-04-08 13:18:55] ============================================================
 [2026-04-08 13:18:55]   Proxmox Stack Updater
-[2026-04-08 13:18:55]   Host   : grayskull
+[2026-04-08 13:18:55]   Host   : Your Proxmox Host
 [2026-04-08 13:18:55] ============================================================
 [2026-04-08 13:18:56] [ OK] HOST — No security patches pending
 [2026-04-08 13:18:57] ===  [100] plex
