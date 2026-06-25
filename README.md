@@ -1,5 +1,9 @@
 # ProxSweep
 
+[![License](https://img.shields.io/github/license/AkuchiS/proxsweep?color=8A2BE2)](LICENSE)
+[![Last commit](https://img.shields.io/github/last-commit/AkuchiS/proxsweep?color=8A2BE2)](https://github.com/AkuchiS/proxsweep/commits)
+[![Stars](https://img.shields.io/github/stars/AkuchiS/proxsweep?color=8A2BE2)](https://github.com/AkuchiS/proxsweep/stargazers)
+
 Automated update script for Proxmox VE homelab stacks. Runs on the Proxmox host and handles every container type in one pass — no per-container configuration required.
 
 ## What it does
