@@ -110,3 +110,7 @@ PRs welcome. If you run a container type not covered (e.g. Alpine apk, Fedora dn
 ## License
 
 MIT
+
+---
+
+<sub>An [AkuchiS](https://github.com/AkuchiS) tool · more at [github.akuchis.com](https://github.akuchis.com) · [Sponsor the work](https://github.com/sponsors/AkuchiS)</sub>
